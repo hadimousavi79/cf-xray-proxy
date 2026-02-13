@@ -1,22 +1,32 @@
+import { MAX_RETRIES } from '../config';
+import { withBackendFailureMarker } from '../backend';
 import type { Env } from '../types';
 import {
   BACKEND_PASSTHROUGH_TIMEOUT_MS,
   BACKEND_UPGRADE_TIMEOUT_MS,
   fetchWithTimeout,
   isAbortError,
+  normalizeRetryCount,
+  waitForRetry,
 } from '../utils/fetch';
 import { textResponse } from '../utils/response';
 import {
   bridgeSockets,
   buildBackendPassthroughHeaders,
   buildBackendUpgradeHeaders,
+  closeSocketPair,
   hasUpgradeRequest,
   parseBackendUrl,
+  parseBackendUrlWithOverride,
   safeClose,
   toPassthroughInit,
 } from '../utils/socket';
 
 type XhttpMode = 'auto' | 'packet-up';
+interface EarlyDataParseResult {
+  data: Uint8Array | null;
+  errorMessage: string | null;
+}
 
 const EARLY_DATA_HEADER = 'sec-websocket-protocol';
 const MAX_EARLY_DATA_BYTES = 64 * 1024;
@@ -29,6 +39,19 @@ function isDebugEnabled(env: Env): boolean {
 function validateRequest(request: Request): Response | null {
   void request;
   return null;
+}
+
+function resolveMaxAttempts(env: Env, backendOverride?: URL): number {
+  if (backendOverride) {
+    return 1;
+  }
+
+  const parsed = Number(env.MAX_RETRIES);
+  return Math.max(1, normalizeRetryCount(parsed, MAX_RETRIES));
+}
+
+function shouldRetryUpgradeStatus(status: number): boolean {
+  return status === 408 || status === 429 || status >= 500;
 }
 
 function parseEarlyDataHint(url: URL): number {
@@ -77,37 +100,52 @@ function decodeBase64UrlToUint8Array(base64Url: string): Uint8Array {
   return output;
 }
 
-function parseEarlyDataFromHeader(request: Request, maxBytes: number): Uint8Array | null {
+/**
+ * Extracts and validates optional xhttp early-data carried via Sec-WebSocket-Protocol.
+ */
+function parseEarlyDataFromHeader(request: Request, maxBytes: number): EarlyDataParseResult {
   if (maxBytes <= 0) {
-    return null;
+    return { data: null, errorMessage: null };
   }
 
   const rawHeader = request.headers.get(EARLY_DATA_HEADER);
 
   if (!rawHeader) {
-    return null;
+    return { data: null, errorMessage: null };
   }
 
   const token = rawHeader.split(',')[0]?.trim();
 
   if (!token || !isLikelyBase64UrlToken(token)) {
-    return null;
+    return { data: null, errorMessage: null };
   }
 
   try {
     const decoded = decodeBase64UrlToUint8Array(token);
 
     if (decoded.byteLength > maxBytes) {
-      return null;
+      return {
+        data: null,
+        errorMessage: `xhttp early-data exceeds limit (${decoded.byteLength} > ${maxBytes} bytes).`,
+      };
     }
 
-    return decoded;
+    return { data: decoded, errorMessage: null };
   } catch {
-    return null;
+    return {
+      data: null,
+      errorMessage: 'Invalid xhttp early-data encoding in Sec-WebSocket-Protocol header.',
+    };
   }
 }
 
-export async function handleUpgrade(request: Request, env: Env): Promise<Response> {
+export async function handleUpgrade(
+  request: Request,
+  env: Env,
+  backendOverride?: URL,
+  onConnectionClosed?: () => void,
+  onConnectionReady?: (disconnect: (code: number, reason: string) => void) => void,
+): Promise<Response> {
   const validationError = validateRequest(request);
 
   if (validationError) {
@@ -136,7 +174,9 @@ export async function handleUpgrade(request: Request, env: Env): Promise<Respons
   let backendUrl: URL;
 
   try {
-    backendUrl = parseBackendUrl(request, env, requestUrl);
+    backendUrl = backendOverride
+      ? parseBackendUrlWithOverride(backendOverride, requestUrl)
+      : parseBackendUrl(request, env, requestUrl);
   } catch (error) {
     return textResponse(500, error instanceof Error ? error.message : 'Invalid backend configuration.');
   }
@@ -159,14 +199,14 @@ export async function handleUpgrade(request: Request, env: Env): Promise<Respons
       );
     } catch (error) {
       if (isAbortError(error)) {
-        return textResponse(502, 'Backend request timed out.');
+        return withBackendFailureMarker(textResponse(502, 'Backend request timed out.'));
       }
 
       if (debugEnabled) {
         console.error('[xhttp] backend passthrough error', error);
       }
 
-      return textResponse(502, 'Unable to connect to backend service.');
+      return withBackendFailureMarker(textResponse(502, 'Unable to connect to backend service.'));
     }
   }
 
@@ -176,9 +216,19 @@ export async function handleUpgrade(request: Request, env: Env): Promise<Respons
   workerSocket.accept();
 
   const backendHeaders = buildBackendUpgradeHeaders(request);
+  const maxAttempts = resolveMaxAttempts(env, backendOverride);
+  let lastStatus: number | null = null;
+  let lastError: unknown = null;
+  let lastErrorWasTimeout = false;
+  let earlyDataForwardFailed = false;
 
   // xhttp early-data may be encoded in Sec-WebSocket-Protocol on some clients.
-  const earlyDataChunk = parseEarlyDataFromHeader(request, earlyDataHint);
+  const earlyDataResult = parseEarlyDataFromHeader(request, earlyDataHint);
+  if (earlyDataResult.errorMessage) {
+    closeSocketPair(workerSocket, clientSocket, 1002, 'Invalid early-data');
+    return textResponse(400, earlyDataResult.errorMessage);
+  }
+  const earlyDataChunk = earlyDataResult.data;
   if (earlyDataChunk) {
     // Prevent duplicated delivery when early-data is extracted and sent as first WS frame.
     backendHeaders.delete(EARLY_DATA_HEADER);
@@ -190,54 +240,144 @@ export async function handleUpgrade(request: Request, env: Env): Promise<Respons
       mode,
       earlyDataHint,
       earlyDataBytes: earlyDataChunk?.byteLength ?? 0,
+      maxAttempts,
     });
   }
 
-  try {
-    const backendResponse = await fetchWithTimeout(
-      backendUrl.toString(),
-      {
-        method: 'GET',
-        headers: backendHeaders,
-        redirect: 'manual',
-      },
-      BACKEND_UPGRADE_TIMEOUT_MS,
-    );
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const backendResponse = await fetchWithTimeout(
+        backendUrl.toString(),
+        {
+          method: 'GET',
+          headers: backendHeaders,
+          redirect: 'manual',
+        },
+        BACKEND_UPGRADE_TIMEOUT_MS,
+        0,
+      );
 
-    if (backendResponse.status !== 101 || !backendResponse.webSocket) {
-      await backendResponse.body?.cancel();
-      safeClose(workerSocket, 1011, `Backend upgrade rejected (${backendResponse.status})`);
-      return textResponse(502, `Backend failed to upgrade connection (status ${backendResponse.status}).`);
-    }
+      if (backendResponse.status !== 101 || !backendResponse.webSocket) {
+        lastStatus = backendResponse.status;
+        await backendResponse.body?.cancel();
 
-    const backendSocket = backendResponse.webSocket;
-    backendSocket.accept();
+        const shouldRetry = attempt < maxAttempts && shouldRetryUpgradeStatus(backendResponse.status);
+        if (!shouldRetry) {
+          closeSocketPair(
+            workerSocket,
+            clientSocket,
+            1011,
+            `Backend upgrade rejected (${backendResponse.status})`,
+          );
+          return withBackendFailureMarker(
+            textResponse(
+              502,
+              `Backend failed to upgrade xhttp connection (status ${backendResponse.status}, mode ${mode}, attempt ${attempt}/${maxAttempts}).`,
+            ),
+          );
+        }
 
-    if (earlyDataChunk && earlyDataChunk.byteLength > 0) {
-      backendSocket.send(earlyDataChunk);
-    }
+        if (debugEnabled) {
+          console.warn('[xhttp] backend rejected upgrade attempt', {
+            backendUrl: backendUrl.toString(),
+            status: backendResponse.status,
+            mode,
+            attempt,
+            maxAttempts,
+          });
+        }
+      } else {
+        const backendSocket = backendResponse.webSocket;
+        try {
+          backendSocket.accept();
 
-    bridgeSockets(workerSocket, backendSocket, (direction, error) => {
-      if (debugEnabled) {
-        console.log('[xhttp]', 'relay error', { direction, error });
+          if (earlyDataChunk && earlyDataChunk.byteLength > 0) {
+            try {
+              backendSocket.send(earlyDataChunk);
+            } catch (error) {
+              earlyDataForwardFailed = true;
+              throw error;
+            }
+          }
+
+          bridgeSockets(
+            workerSocket,
+            backendSocket,
+            (direction, error) => {
+              if (debugEnabled) {
+                console.log('[xhttp]', 'relay error', { direction, error });
+              }
+            },
+            onConnectionClosed,
+            onConnectionReady,
+          );
+
+          return new Response(null, {
+            status: 101,
+            webSocket: clientSocket,
+          });
+        } catch (error) {
+          safeClose(
+            backendSocket,
+            1011,
+            earlyDataForwardFailed ? 'Failed to forward early-data' : 'Failed to initialize xhttp bridge',
+          );
+          throw error;
+        }
       }
-    });
+    } catch (error) {
+      lastError = error;
+      lastErrorWasTimeout = isAbortError(error);
 
-    return new Response(null, {
-      status: 101,
-      webSocket: clientSocket,
-    });
-  } catch (error) {
-    safeClose(workerSocket, 1011, 'Unable to connect to backend');
+      if (debugEnabled) {
+        console.error('[xhttp] backend connection attempt failed', {
+          backendUrl: backendUrl.toString(),
+          mode,
+          attempt,
+          maxAttempts,
+          error,
+        });
+      }
 
-    if (isAbortError(error)) {
-      return textResponse(502, 'Backend upgrade timed out.');
+      if (attempt >= maxAttempts) {
+        break;
+      }
     }
 
-    if (debugEnabled) {
-      console.error('[xhttp] backend connection error', error);
+    if (attempt < maxAttempts) {
+      await waitForRetry(attempt - 1);
     }
-
-    return textResponse(502, 'Unable to connect to backend service.');
   }
+
+  closeSocketPair(workerSocket, clientSocket, 1011, 'Unable to connect to backend');
+
+  if (earlyDataForwardFailed) {
+    return withBackendFailureMarker(
+      textResponse(502, `Failed to forward xhttp early-data after ${maxAttempts} attempts.`),
+    );
+  }
+
+  if (lastErrorWasTimeout) {
+    return withBackendFailureMarker(textResponse(502, `Backend xhttp upgrade timed out after ${maxAttempts} attempts.`));
+  }
+
+  if (lastStatus !== null) {
+    return withBackendFailureMarker(
+      textResponse(
+        502,
+        `Backend xhttp upgrade failed after ${maxAttempts} attempts (status ${lastStatus}, mode ${mode}).`,
+      ),
+    );
+  }
+
+  if (debugEnabled && lastError) {
+    console.error('[xhttp] backend connection error', lastError);
+  }
+
+  return withBackendFailureMarker(
+    textResponse(
+      502,
+      `Unable to connect to backend service for xhttp transport after ${maxAttempts} attempts.`,
+    ),
+  );
 }

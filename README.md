@@ -41,6 +41,16 @@ The backend remains the protocol/authentication authority.
 - Select transports per request via query/header/path without redeploying.
 - Keep Worker logic thin and backend-focused for VLESS/VMess validation and policy.
 
+## Features
+
+- Multi-backend support with weighted selection and automatic failover.
+- Periodic backend health checking with auto-recovery.
+- Exponential backoff retry with jitter for backend retries.
+- Connection-based rate limiting (per-IP concurrent and per-minute attempts).
+- UUID-based maximum active connection limiting.
+- Optional subscription proxy (`/sub/...`) with in-memory caching.
+- Built-in observability endpoints: `GET /health` and `GET /status` (when `DEBUG=true`).
+
 ## Architecture
 
 ```text
@@ -49,19 +59,24 @@ Client (VLESS / VMess)
         | HTTPS / TLS
         v
 Cloudflare Worker (this repo)
-  - transport selection
-  - upgrade handling
-  - request forwarding
+  - Router / transport selection
+  - BackendManager (weights, health checks, failover)
+  - RateLimiter (connection-based, per IP)
+  - UUIDManager (per-UUID active connection cap)
+  - SubscriptionProxy (optional `/sub` routes)
         |
-        | HTTP or HTTPS (BACKEND_URL)
+        | HTTP or HTTPS (BACKEND_URL / BACKEND_LIST)
         v
-Backend (Xray / sing-box)
+Backend pool (Xray / sing-box)
+  - backend-1
+  - backend-2
+  - backend-N
   - authentication
   - protocol validation
   - routing / outbound
 ```
 
-> TLS terminates at Cloudflare Worker edge. `BACKEND_URL` can be `http://...` or `https://...`.
+> TLS terminates at Cloudflare Worker edge. `BACKEND_URL` and each `BACKEND_LIST` entry can be `http://...` or `https://...`.
 
 ## Supported transports
 
@@ -101,9 +116,22 @@ Selection logic is implemented in `src/index.ts`:
 
 | Name | Required | Default | Description | Examples |
 | --- | --- | --- | --- | --- |
-| `BACKEND_URL` | No | Falls back to `BACKEND_ORIGIN` | Backend origin URL used for all forwarding | `http://127.0.0.1:10000`, `https://backend.example.com:443` |
+| `BACKEND_URL` | No | `http://127.0.0.1:10000` | Backward-compatible single backend origin | `http://127.0.0.1:10000` |
+| `BACKEND_LIST` | No | `http://127.0.0.1:10000` | Comma-separated backend list, supports optional weights via `url\|weight` | `http://be1:10000\|2,http://be2:10000\|1` |
+| `BACKEND_HEALTH_CHECK_INTERVAL` | No | `30000` | Backend health check interval in milliseconds | `10000`, `30000` |
+| `BACKEND_STICKY_SESSION` | No | `false` | When `true`, prefer first healthy backend in list order; when `false`, use weighted random | `true`, `false` |
+| `MAX_RETRIES` | No | `3` | Maximum retry attempts for backend failover/retry paths | `1`, `3`, `5` |
+| `RATE_LIMIT_ENABLED` | No | `false` | Enables connection-based per-IP rate limiting | `true`, `false` |
+| `RATE_LIMIT_MAX_CONN_PER_IP` | No | `5` | Maximum concurrent upgraded connections per IP | `3`, `5`, `20` |
+| `RATE_LIMIT_MAX_CONN_PER_MIN` | No | `10` | Maximum new upgraded connections per IP per minute | `10`, `30`, `60` |
+| `UUID_MAX_CONNECTIONS` | No | `0` | Maximum active connections per UUID (`0` disables feature) | `0`, `1`, `2` |
+| `SUBSCRIPTION_ENABLED` | No | `false` | Enables subscription proxy routes | `true`, `false` |
+| `SUBSCRIPTION_PRESERVE_DOMAIN` | No | `false` | Rewrites upstream subscription domains back to configured target domain | `true`, `false` |
+| `SUBSCRIPTION_TARGETS` | No | empty | Subscription backend mapping, JSON array or `name\|url\|port\|path` format | `phone\|https://phonepanel.ir\|443\|/sub,xui\|https://sub.xui.com:2096\|2096\|/sub` |
+| `SUBSCRIPTION_TRANSFORM` | No | `false` | Enables response link transformation for subscription proxy responses | `true`, `false` |
+| `SUBSCRIPTION_CACHE_TTL_MS` | No | `300000` | In-memory subscription cache TTL in milliseconds | `60000`, `300000` |
 | `TRANSPORT` | No | `xhttp` | Default transport when no query/header/path selector matches | `xhttp`, `httpupgrade`, `ws` |
-| `DEBUG` | No | effectively `false` unless exactly `true` | Enables debug logs in router and transport handlers | `true`, `false` |
+| `DEBUG` | No | `false` | Enables debug logs and `GET /status` endpoint | `true`, `false` |
 | `BACKEND_ORIGIN` (code constant) | No (not an env var) | `http://127.0.0.1:10000` | Fallback backend origin defined in `src/config.ts` | `http://127.0.0.1:10000` |
 
 ### Set variables for local `wrangler dev`
@@ -111,7 +139,19 @@ Selection logic is implemented in `src/index.ts`:
 Option A: one command invocation
 
 ```bash
-BACKEND_URL="http://127.0.0.1:10000" TRANSPORT="xhttp" DEBUG="true" wrangler dev
+BACKEND_LIST="http://127.0.0.1:10000|2,http://127.0.0.1:10001|1" \
+BACKEND_HEALTH_CHECK_INTERVAL="30000" \
+BACKEND_STICKY_SESSION="false" \
+MAX_RETRIES="3" \
+RATE_LIMIT_ENABLED="true" \
+RATE_LIMIT_MAX_CONN_PER_IP="5" \
+RATE_LIMIT_MAX_CONN_PER_MIN="10" \
+UUID_MAX_CONNECTIONS="2" \
+SUBSCRIPTION_ENABLED="false" \
+SUBSCRIPTION_PRESERVE_DOMAIN="false" \
+TRANSPORT="xhttp" \
+DEBUG="true" \
+wrangler dev
 ```
 
 Option B: keep defaults in `wrangler.toml` under `[vars]` and run:
@@ -126,9 +166,20 @@ wrangler dev
 
 ```toml
 [vars]
+BACKEND_LIST = "http://127.0.0.1:10000|2,http://127.0.0.1:10001|1"
+BACKEND_HEALTH_CHECK_INTERVAL = "30000"
+BACKEND_STICKY_SESSION = "false"
+MAX_RETRIES = "3"
+RATE_LIMIT_ENABLED = "true"
+RATE_LIMIT_MAX_CONN_PER_IP = "5"
+RATE_LIMIT_MAX_CONN_PER_MIN = "10"
+UUID_MAX_CONNECTIONS = "2"
+SUBSCRIPTION_ENABLED = "false"
+SUBSCRIPTION_PRESERVE_DOMAIN = "false"
 TRANSPORT = "xhttp"
 DEBUG = "false"
-# BACKEND_URL = "http://your-backend:10000"
+# BACKEND_URL remains supported for single-backend compatibility
+# SUBSCRIPTION_TARGETS = "phone|https://phonepanel.ir|443|/sub,xui|https://sub.xui.com:2096|2096|/sub"
 ```
 
 2. Deploy:
@@ -144,9 +195,118 @@ wrangler deploy
 3. Go to **Settings** -> **Variables and Secrets**.
 4. Add variables:
    - `BACKEND_URL`
+   - `BACKEND_LIST`
+   - `BACKEND_HEALTH_CHECK_INTERVAL`
+   - `BACKEND_STICKY_SESSION`
+   - `MAX_RETRIES`
+   - `RATE_LIMIT_ENABLED`
+   - `RATE_LIMIT_MAX_CONN_PER_IP`
+   - `RATE_LIMIT_MAX_CONN_PER_MIN`
+   - `UUID_MAX_CONNECTIONS`
+   - `SUBSCRIPTION_ENABLED`
+   - `SUBSCRIPTION_PRESERVE_DOMAIN`
+   - `SUBSCRIPTION_TARGETS`
    - `TRANSPORT`
    - `DEBUG`
 5. Save and deploy.
+
+## Multi-Backend Setup
+
+### Configure multiple backends
+
+Use `BACKEND_LIST` as comma-separated entries:
+
+- Format: `url` or `url|weight`
+- Weight defaults to `1` when omitted
+- `BACKEND_URL` still works and is kept for backward compatibility
+
+```bash
+BACKEND_LIST="http://be1.internal:10000|3,http://be2.internal:10000|1,http://be3.internal:10000"
+```
+
+### Load balancing and failover behavior
+
+- Backend selection uses weighted random distribution by default.
+- Set `BACKEND_STICKY_SESSION=true` to prefer first healthy backend in list order.
+- Unhealthy backends are skipped while healthy backends are available.
+- On backend failure, the Worker retries using another backend up to `MAX_RETRIES`.
+- Retry waits use exponential backoff with jitter to avoid synchronized retry bursts.
+- Health checks run every `BACKEND_HEALTH_CHECK_INTERVAL` and auto-recover backends when they respond again.
+- If all backends are unhealthy, the manager falls back to any available backend to avoid total blackhole behavior.
+
+## Rate Limiting
+
+### How it works
+
+- Limiting is connection-based, not packet/message-based.
+- It applies to new upgrade attempts only.
+- Two limits are enforced per IP:
+  - concurrent upgraded connections (`RATE_LIMIT_MAX_CONN_PER_IP`)
+  - new upgraded connections per minute (`RATE_LIMIT_MAX_CONN_PER_MIN`)
+- Blocked requests return `429 Too Many Requests` with `Retry-After`.
+
+### Why it does not break VPN traffic
+
+- No message count limits.
+- No bandwidth throttling.
+- Long-lived connections remain allowed.
+- Disabled by default (`RATE_LIMIT_ENABLED=false`) for minimal overhead when not needed.
+
+### Example
+
+```toml
+[vars]
+RATE_LIMIT_ENABLED = "true"
+RATE_LIMIT_MAX_CONN_PER_IP = "5"
+RATE_LIMIT_MAX_CONN_PER_MIN = "10"
+```
+
+## Subscription Proxy
+
+### When to use it
+
+Enable this when you want to serve subscription endpoints through the Worker without exposing subscription backends directly.
+
+### How to enable
+
+```toml
+[vars]
+SUBSCRIPTION_ENABLED = "true"
+SUBSCRIPTION_TARGETS = "phone|https://phonepanel.ir|443|/sub,xui|https://sub.xui.com:2096|2096|/sub,node|http://10.0.0.8|4005|/subscribe"
+# Optional:
+# SUBSCRIPTION_TRANSFORM = "true"
+# SUBSCRIPTION_CACHE_TTL_MS = "300000"
+```
+
+### Supported target formats
+
+Delimited format:
+
+```text
+name|url|port|path,name2|url2|port2|path2
+```
+
+JSON format:
+
+```json
+[
+  { "name": "phone", "url": "https://phonepanel.ir", "port": 443, "path": "/sub" },
+  { "name": "xui", "url": "https://sub.xui.com:2096", "port": 2096, "path": "/sub" }
+]
+```
+
+### Routes
+
+- `/sub/:token` -> uses default/fallback target selection.
+- `/:service/sub/:token` -> uses named target (falls back to first configured target if name is not found).
+
+The proxy enforces:
+
+- upstream timeout: 10 seconds
+- max upstream response size: 10 MB
+- cache: in-memory, successful (`200`) responses only
+
+When disabled (`SUBSCRIPTION_ENABLED=false`), subscription routing is bypassed for minimal impact.
 
 ## Quickstart
 
@@ -224,7 +384,7 @@ wrangler login
    - `name`
    - `main`
    - `compatibility_date`
-   - `[vars]` values (`TRANSPORT`, `DEBUG`, optional `BACKEND_URL`)
+   - `[vars]` values (backend pool, retries, limits, transport, and debug settings)
 
 3. Deploy:
 
@@ -314,18 +474,26 @@ Look for handler prefixes:
 
 ## Security considerations
 
-- This Worker forwards traffic and manages upgrades; it does not enforce UUID/port/path validation.
-- Backend Xray/sing-box must enforce authentication, protocol checks, and routing policy.
-- Keep backend ingress restricted to expected sources.
-- Use `DEBUG=false` for normal production operation.
+- This Worker forwards traffic and manages upgrades; backend Xray/sing-box remains the authority for authentication and protocol policy.
+- Enable `RATE_LIMIT_ENABLED=true` to reduce abusive connection churn without limiting normal tunnel payload traffic.
+- Use `UUID_MAX_CONNECTIONS` to cap concurrent usage per UUID (`0` keeps the feature disabled).
+- Prefer private/internal backend addresses and restrict backend ingress to expected sources (Cloudflare egress or trusted networks).
+- Use `BACKEND_LIST` to isolate failure domains across multiple backend instances.
+- Keep `DEBUG=false` in normal production operation to reduce log exposure.
 
 ## Landing page
 
-`GET /` and `GET /index.html` document requests are served by `src/landing.ts` with cache header:
+When `SUBSCRIPTION_ENABLED=false`:
+
+- `GET /` and `GET /index.html` document requests are served by `src/landing.ts` with cache header:
 
 ```text
 Cache-Control: public, max-age=3600
 ```
+
+When `SUBSCRIPTION_ENABLED=true`:
+
+- root requests return subscription info text instead of the HTML landing page.
 
 ## License
 
