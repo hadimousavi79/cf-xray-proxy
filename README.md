@@ -51,6 +51,24 @@ The backend remains the protocol/authentication authority.
 - Optional subscription proxy (`/sub/...`) with in-memory caching.
 - Built-in observability endpoints: `GET /health` and `GET /status` (when `DEBUG=true`).
 
+## ☕ Support this project
+
+If you find this project useful, consider supporting its development:
+
+<p align="center">
+  <a href="https://buymeacoffee.com/PdYrust" target="_blank">
+    <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50" width="210" />
+  </a>
+</p>
+
+<p align="center">
+  <strong>Or with TON (Tonkeeper):</strong><br/>
+  <code>UQC_4BlT2iUlliYUDDCzkDBhBPrww3plMH3XqWaWeDRXfWVj</code><br/>
+  <a href="https://app.tonkeeper.com/transfer/UQC_4BlT2iUlliYUDDCzkDBhBPrww3plMH3XqWaWeDRXfWVj">
+    <img src="https://img.shields.io/badge/Tonkeeper-0098EA?style=for-the-badge&logo=ton&logoColor=white" alt="Donate with Tonkeeper" />
+  </a>
+</p>
+
 ## Architecture
 
 ```text
