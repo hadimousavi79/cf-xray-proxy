@@ -56,18 +56,19 @@ The backend remains the protocol/authentication authority.
 If you find this project useful, consider supporting its development:
 
 <p align="center">
-  <a href="https://buymeacoffee.com/PdYrust" target="_blank">
-    <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50" width="210" />
+  <a href="https://link.trustwallet.com/send?coin=195&address=TUWcBfKhmpLQBC961oCJf7zuXTN2ezMbkF&token_id=TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t">
+    <img src="https://img.shields.io/badge/USDT%20(TRC20)-26A17B?style=for-the-badge&logo=tether&logoColor=white" alt="USDT TRC20" />
+  </a>
+  <a href="https://app.tonkeeper.com/transfer/UQC_4BlT2iUlliYUDDCzkDBhBPrww3plMH3XqWaWeDRXfWVj">
+    <img src="https://img.shields.io/badge/TON-0098EA?style=for-the-badge&logo=ton&logoColor=white" alt="TON" />
   </a>
 </p>
 
 <p align="center">
-  <strong>Or with TON (Tonkeeper):</strong><br/>
-  <code>UQC_4BlT2iUlliYUDDCzkDBhBPrww3plMH3XqWaWeDRXfWVj</code><br/>
-  <a href="https://app.tonkeeper.com/transfer/UQC_4BlT2iUlliYUDDCzkDBhBPrww3plMH3XqWaWeDRXfWVj">
-    <img src="https://img.shields.io/badge/Tonkeeper-0098EA?style=for-the-badge&logo=ton&logoColor=white" alt="Donate with Tonkeeper" />
-  </a>
+  <strong>USDT (TRC-20):</strong> <code>TUWcBfKhmpLQBC961oCJf7zuXTN2ezMbkF</code><br/>
+  <strong>TON:</strong> <code>UQC_4BlT2iUlliYUDDCzkDBhBPrww3plMH3XqWaWeDRXfWVj</code>
 </p>
+
 
 ## Architecture
 
