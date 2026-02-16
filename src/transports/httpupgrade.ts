@@ -13,7 +13,6 @@ import { textResponse } from '../utils/response';
 import {
   bridgeSockets,
   buildBackendPassthroughHeaders,
-  buildBackendUpgradeHeaders,
   closeSocketPair,
   hasUpgradeRequest,
   parseBackendUrl,
@@ -21,6 +20,7 @@ import {
   safeClose,
   toPassthroughInit,
 } from '../utils/socket';
+import { buildBackendUpgradeHeaders } from '../utils/ws-protocol';
 
 function isDebugEnabled(env: Env): boolean {
   return env.DEBUG === 'true';
