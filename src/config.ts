@@ -21,5 +21,6 @@ export const RATE_LIMIT_MAX_CONN_PER_MIN = 10;
 export const UUID_MAX_CONNECTIONS = 0;
 export const DEFAULT_TRANSPORT: TransportType = 'xhttp';
 export const DEBUG = 'false';
+export const HIDE_BACKEND_URLS = 'true';
 
 export const SUPPORTED_TRANSPORTS = ['xhttp', 'httpupgrade', 'ws'] as const satisfies readonly TransportType[];

@@ -89,15 +89,6 @@ export function buildBackendPassthroughHeaders(request: Request): Headers {
   return headers;
 }
 
-export function buildBackendUpgradeHeaders(request: Request, upgradeValue = 'websocket'): Headers {
-  const headers = new Headers(request.headers);
-  headers.delete('Host');
-  headers.set('Connection', 'Upgrade');
-  headers.set('Upgrade', upgradeValue);
-  headers.delete('Sec-WebSocket-Extensions');
-  return headers;
-}
-
 export function toPassthroughInit(request: Request, headers: Headers): RequestInit {
   const method = request.method.toUpperCase();
 

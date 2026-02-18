@@ -1,4 +1,4 @@
-import { DEFAULT_TRANSPORT, SUPPORTED_TRANSPORTS } from './config';
+import { DEFAULT_TRANSPORT, HIDE_BACKEND_URLS, SUPPORTED_TRANSPORTS } from './config';
 import {
   BackendManager,
   isBackendFailureResponse,
@@ -46,6 +46,16 @@ const UUID_MAX_CONNECTIONS_CACHE = new Map<string, number>();
 
 function isDebugEnabled(env: Env): boolean {
   return env.DEBUG === 'true';
+}
+
+function shouldHideBackendUrls(env: Env): boolean {
+  const configured = env.HIDE_BACKEND_URLS?.trim().toLowerCase();
+
+  if (!configured) {
+    return HIDE_BACKEND_URLS === 'true';
+  }
+
+  return configured !== 'false';
 }
 
 function getBackendManagerCacheKey(env: Env): string {
@@ -386,14 +396,26 @@ function isStatusEndpoint(request: Request, pathname: string): boolean {
 
 function buildHealthResponse(env: Env): Response {
   const backendStates = getBackendManager(env).getStates();
+  const totalBackends = backendStates.length;
   const healthyBackends = backendStates.filter((backend) => backend.healthy).length;
+  const status = healthyBackends > 0 ? 'ok' : 'degraded';
+
+  if (!shouldHideBackendUrls(env)) {
+    return jsonResponse(200, {
+      status,
+      timestamp: Date.now(),
+      totalBackends,
+      healthyBackends,
+      backends: backendStates,
+    });
+  }
 
   return jsonResponse(200, {
-    status: healthyBackends > 0 ? 'ok' : 'degraded',
+    status,
     timestamp: Date.now(),
-    totalBackends: backendStates.length,
+    totalBackends,
     healthyBackends,
-    backends: backendStates,
+    unhealthyBackends: Math.max(0, totalBackends - healthyBackends),
   });
 }
 

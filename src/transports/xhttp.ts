@@ -13,7 +13,6 @@ import { textResponse } from '../utils/response';
 import {
   bridgeSockets,
   buildBackendPassthroughHeaders,
-  buildBackendUpgradeHeaders,
   closeSocketPair,
   hasUpgradeRequest,
   parseBackendUrl,
@@ -21,14 +20,13 @@ import {
   safeClose,
   toPassthroughInit,
 } from '../utils/socket';
+import {
+  buildBackendUpgradeHeaders,
+  parseEarlyDataFromWebSocketProtocolHeader,
+  SEC_WEBSOCKET_PROTOCOL_HEADER,
+} from '../utils/ws-protocol';
 
 type XhttpMode = 'auto' | 'packet-up';
-interface EarlyDataParseResult {
-  data: Uint8Array | null;
-  errorMessage: string | null;
-}
-
-const EARLY_DATA_HEADER = 'sec-websocket-protocol';
 const MAX_EARLY_DATA_BYTES = 64 * 1024;
 const ALLOWED_MODES: readonly XhttpMode[] = ['auto', 'packet-up'];
 
@@ -80,63 +78,6 @@ function parseMode(url: URL, request: Request): XhttpMode {
   }
 
   throw new Error('Invalid xhttp mode. Supported values are auto and packet-up.');
-}
-
-function isLikelyBase64UrlToken(value: string): boolean {
-  return value.length > 0 && /^[A-Za-z0-9_-]+$/.test(value);
-}
-
-function decodeBase64UrlToUint8Array(base64Url: string): Uint8Array {
-  const normalized = base64Url.replace(/-/g, '+').replace(/_/g, '/');
-  const paddingNeeded = (4 - (normalized.length % 4)) % 4;
-  const padded = normalized + '='.repeat(paddingNeeded);
-  const binary = atob(padded);
-  const output = new Uint8Array(binary.length);
-
-  for (let i = 0; i < binary.length; i += 1) {
-    output[i] = binary.charCodeAt(i);
-  }
-
-  return output;
-}
-
-/**
- * Extracts and validates optional xhttp early-data carried via Sec-WebSocket-Protocol.
- */
-function parseEarlyDataFromHeader(request: Request, maxBytes: number): EarlyDataParseResult {
-  if (maxBytes <= 0) {
-    return { data: null, errorMessage: null };
-  }
-
-  const rawHeader = request.headers.get(EARLY_DATA_HEADER);
-
-  if (!rawHeader) {
-    return { data: null, errorMessage: null };
-  }
-
-  const token = rawHeader.split(',')[0]?.trim();
-
-  if (!token || !isLikelyBase64UrlToken(token)) {
-    return { data: null, errorMessage: null };
-  }
-
-  try {
-    const decoded = decodeBase64UrlToUint8Array(token);
-
-    if (decoded.byteLength > maxBytes) {
-      return {
-        data: null,
-        errorMessage: `xhttp early-data exceeds limit (${decoded.byteLength} > ${maxBytes} bytes).`,
-      };
-    }
-
-    return { data: decoded, errorMessage: null };
-  } catch {
-    return {
-      data: null,
-      errorMessage: 'Invalid xhttp early-data encoding in Sec-WebSocket-Protocol header.',
-    };
-  }
 }
 
 export async function handleUpgrade(
@@ -223,15 +164,18 @@ export async function handleUpgrade(
   let earlyDataForwardFailed = false;
 
   // xhttp early-data may be encoded in Sec-WebSocket-Protocol on some clients.
-  const earlyDataResult = parseEarlyDataFromHeader(request, earlyDataHint);
+  const earlyDataResult = parseEarlyDataFromWebSocketProtocolHeader(
+    request.headers.get(SEC_WEBSOCKET_PROTOCOL_HEADER),
+    earlyDataHint,
+  );
   if (earlyDataResult.errorMessage) {
     closeSocketPair(workerSocket, clientSocket, 1002, 'Invalid early-data');
     return textResponse(400, earlyDataResult.errorMessage);
   }
   const earlyDataChunk = earlyDataResult.data;
-  if (earlyDataChunk) {
+  if (earlyDataResult.shouldStripProtocolHeader) {
     // Prevent duplicated delivery when early-data is extracted and sent as first WS frame.
-    backendHeaders.delete(EARLY_DATA_HEADER);
+    backendHeaders.delete(SEC_WEBSOCKET_PROTOCOL_HEADER);
   }
 
   if (debugEnabled) {

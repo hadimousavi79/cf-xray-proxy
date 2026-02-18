@@ -9,3 +9,4 @@ workers_dev = true
 [vars]
 TRANSPORT = "xhttp"
 DEBUG = "false"
+HIDE_BACKEND_URLS = "true"

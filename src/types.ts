@@ -17,6 +17,7 @@ export interface Env {
   /** Raw env value, validated at runtime before use. */
   TRANSPORT?: string;
   DEBUG?: string;
+  HIDE_BACKEND_URLS?: string;
   UUID_MAX_CONNECTIONS?: string;
 }
 
